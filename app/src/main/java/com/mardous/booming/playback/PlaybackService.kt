@@ -473,36 +473,39 @@ class PlaybackService :
             .setOffline(true)
             .setExtras(outExtras)
             .build()
-        val mediaItem = if (isKnownCaller) {
-            when {
-                params?.isRecent == true -> {
-                    MediaItem.Builder()
-                        .setMediaId(MediaIDs.RECENT_SONGS)
-                        .setMediaMetadata(
-                            MediaMetadata.Builder()
-                                .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
-                                .setIsBrowsable(true)
-                                .setIsPlayable(false)
-                                .build()
-                        )
-                        .build()
-                }
 
-                else -> {
-                    MediaItem.Builder()
-                        .setMediaId(MediaIDs.ROOT)
-                        .setMediaMetadata(
-                            MediaMetadata.Builder()
-                                .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
-                                .setIsBrowsable(true)
-                                .setIsPlayable(false)
-                                .build()
-                        )
-                        .build()
-                }
+        // Deny untrusted callers instead of returning an empty MediaItem (which would crash
+        // LibraryResult.ofItem because mediaId must not be empty).
+        if (!isKnownCaller) {
+            return Futures.immediateFuture(LibraryResult.ofError<MediaItem>(SessionError.ERROR_PERMISSION_DENIED))
+        }
+
+        val mediaItem = when {
+            params?.isRecent == true -> {
+                MediaItem.Builder()
+                    .setMediaId(MediaIDs.RECENT_SONGS)
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                            .setIsBrowsable(true)
+                            .setIsPlayable(false)
+                            .build()
+                    )
+                    .build()
             }
-        } else {
-            MediaItem.EMPTY
+
+            else -> {
+                MediaItem.Builder()
+                    .setMediaId(MediaIDs.ROOT)
+                    .setMediaMetadata(
+                        MediaMetadata.Builder()
+                            .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                            .setIsBrowsable(true)
+                            .setIsPlayable(false)
+                            .build()
+                    )
+                    .build()
+            }
         }
         return Futures.immediateFuture(LibraryResult.ofItem(mediaItem, libraryParams))
     }
@@ -998,325 +1001,3 @@ class PlaybackService :
 
     private fun modesBundle() = Bundle().apply {
         putBoolean(Playback.EXTRA_SHUFFLE_MODE, player.shuffleModeEnabled)
-        putInt(Playback.EXTRA_REPEAT_MODE, player.repeatMode)
-    }
-
-    private suspend fun toggleFavorite() {
-        withContext(IO) {
-            val song = queueStateHolder.currentSong.first()
-            if (song != Song.emptySong) repository.toggleFavorite(song)
-        }
-
-        widgets.refresh()
-        refreshMediaButtonCustomLayout()
-        mediaSession?.broadcastCustomCommand(
-            SessionCommand(Playback.EVENT_FAVORITE_CONTENT_CHANGED, Bundle.EMPTY),
-            Bundle.EMPTY
-        )
-    }
-
-    /** Only the fields that genuinely come from the player; the rest is [WidgetDataSource]'s. */
-    private suspend fun buildPlaybackState(needs: Set<WidgetData>): PlaybackState {
-        val id = player.currentMediaItem?.mediaId?.toLongOrNull()
-            ?: return PlaybackState()
-
-        val base = PlaybackState(
-            isPlaying = player.isPlaying,
-            songId = id,
-            positionMs = currentPositionMs,
-            durationMs = currentDurationMs,
-            isShuffleMode = player.shuffleModeEnabled,
-            repeatMode = player.repeatMode
-        )
-        return withContext(IO) { WidgetDataSource.enrich(this@PlaybackService, base, needs) }
-    }
-
-    private fun dispatchPlayQueue(player: Player) {
-        buildPlayQueue(player) { songs, position ->
-            queueStateHolder.submitQueue(songs, position)
-        }
-    }
-
-    private fun buildPlayQueue(
-        player: Player,
-        onCompletion: (List<QueueSong>, QueuePosition) -> Unit
-    ) {
-        if (isInTimelineUpdate.load()) return
-
-        generateQueueJob?.cancel()
-        generateQueueJob = serviceScope.launch {
-            delay(QUEUE_DEBOUNCE.milliseconds)
-
-            val timeline = player.currentTimeline
-            if (timeline.isEmpty) {
-                onCompletion(emptyList(), QueuePosition.Undefined)
-                return@launch
-            }
-
-            val shuffleModeEnabled = player.shuffleModeEnabled
-            val currentMediaItemIndex = player.currentMediaItemIndex
-
-            val snapshot = player.captureQueueSnapshot(
-                timeline = timeline,
-                currentMediaItemIndex = currentMediaItemIndex,
-                shuffleMode = shuffleModeEnabled
-            )
-            val position = snapshot.createPosition()
-
-            val (songs, missingMediaItems) = withContext(IO) {
-                repository.songsByMediaItems(snapshot.mediaItems, ignoreBlacklist = true)
-                    .let { (songs, mediaItems) -> snapshot.deriveQueueSongs(songs) to mediaItems }
-            }
-
-            val missingIds = missingMediaItems.mapTo(mutableSetOf()) { it.mediaId }
-            withContext(Main) {
-                if (missingIds.isNotEmpty() &&
-                    isInTimelineUpdate.compareAndSet(false, newValue = true)) {
-                    player.removeMediaItemsById(missingIds)
-                }
-
-                if (isInTimelineUpdate.exchange(false)) {
-                    // The queue structure changed due to the removal of some elements,
-                    // so the last snapshot is no longer valid; what remains now is to
-                    // force a new capture to ensure consistency.
-                    buildPlayQueue(player, onCompletion)
-                    return@withContext
-                }
-
-                onCompletion(
-                    songs,
-                    position.copy(
-                        current = position.getPositionForIndex(player.currentMediaItemIndex)
-                    )
-                )
-            }
-        }
-    }
-
-    private fun createSessionActivityIntent(): PendingIntent {
-        val intent = Intent(this, MainActivity::class.java)
-            .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        return PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-    }
-
-    private fun createNotificationChannel() {
-        var notificationChannel = nm.getNotificationChannel(CHANNEL_ID)
-        if (notificationChannel == null) {
-            notificationChannel = NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.playing_notification_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = getString(R.string.playing_notification_description)
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.O_MR1) {
-                    setShowBadge(false)
-                }
-            }
-            nm.createNotificationChannel(notificationChannel)
-        }
-    }
-
-    private fun refreshMediaButtonCustomLayout() {
-        val hasTimeline = !player.currentTimeline.isEmpty
-        mediaSession?.connectedControllers?.forEach { controllerInfo ->
-            if (mediaSession?.isRemoteController(controllerInfo) == true) {
-                val buttonLayout = if (hasTimeline) {
-                    ImmutableList.of(repeatCommand, shuffleCommand)
-                } else {
-                    emptyList()
-                }
-                mediaSession?.setMediaButtonPreferences(controllerInfo, buttonLayout)
-            }
-        }
-    }
-
-    private fun launchMusicFadeOut(durationMs: Long = 1000) {
-        cancelSleepTimerFadeOut()
-
-        fadeOutAnimator = ValueAnimator.ofFloat(player.volume, 0f).apply {
-            duration = durationMs
-            addUpdateListener { animation ->
-                player.volume = animation.animatedValue as Float
-            }
-            addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationCancel(animation: Animator) {
-                    restorePlayerVolume()
-                }
-
-                override fun onAnimationEnd(animation: Animator) {
-                    player.pause()
-                    restorePlayerVolume()
-                }
-            })
-        }
-        fadeOutAnimator?.start()
-    }
-
-    private fun cancelSleepTimerFadeOut() {
-        fadeOutAnimator?.cancel()
-        fadeOutAnimator = null
-
-        restorePlayerVolume()
-    }
-
-    private fun restorePlayerVolume() {
-        player.volume = equalizerManager.volumeState.value.currentVolume
-    }
-
-    private fun prepareEqualizerAndSoundSettings() {
-        serviceScope.launch {
-            equalizerManager.initializeEqualizer()
-        }
-        serviceScope.launch {
-            equalizerManager.volumeState.collect { volume ->
-                cancelSleepTimerFadeOut()
-                player.volume = volume.currentVolume
-            }
-        }
-        serviceScope.launch {
-            // Turning ReplayGain on must also affect the track already playing.
-            equalizerManager.replayGainState.map { it.mode }.distinctUntilChanged()
-                .collect { mode -> if (mode.isOn) submitReplayGain() }
-        }
-        serviceScope.launch {
-            equalizerManager.audioOffload.collect { audioOffloadingEnabled ->
-                player.trackSelectionParameters = player.trackSelectionParameters
-                    .buildUpon()
-                    .setAudioOffloadPreferences(
-                        AudioOffloadPreferences.Builder()
-                            .setAudioOffloadMode(
-                                if (audioOffloadingEnabled)
-                                    AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
-                                else AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED
-                            )
-                            .setIsSpeedChangeSupportRequired(true)
-                            .build()
-                    )
-                    .build()
-            }
-        }
-        serviceScope.launch {
-            equalizerManager.skipSilence.collect {
-                player.exoPlayer.skipSilenceEnabled = it
-            }
-        }
-        serviceScope.launch {
-            equalizerManager.tempoState.collect {
-                player.playbackParameters = PlaybackParameters(it.speed, it.actualPitch)
-            }
-        }
-        serviceScope.launch {
-            audioOutputObserver.systemVolumeState.collect { systemVolume ->
-                if (pauseOnZeroVolume && persistentStorage.restorationState.isRestored) {
-                    // don't handle volume changes until our player is fully restored
-                    if (isPlaying && systemVolume.currentVolume <= 0f) {
-                        player.pause()
-                        pausedByZeroVolume = true
-                    } else if (pausedByZeroVolume && systemVolume.currentVolume >= 0.1f) {
-                        player.play()
-                        pausedByZeroVolume = false
-                    }
-                }
-            }
-        }
-    }
-
-    private fun updateEqualizerSessionState(isPlaying: Boolean) {
-        eqStateHandler.removeCallbacksAndMessages(null)
-        uiHandler.removeCallbacks(headsetClickRunnable)
-        if (isPlaying) {
-            equalizerManager.setSessionIsActive(true)
-        } else {
-            eqStateHandler.postDelayed(500) {
-                equalizerManager.setSessionIsActive(false)
-            }
-        }
-    }
-
-    private fun registerReceivers() {
-        if (!bluetoothConnectedRegistered) {
-            ContextCompat.registerReceiver(this, bluetoothReceiver, bluetoothConnectedIntentFilter,
-                ContextCompat.RECEIVER_EXPORTED)
-            bluetoothConnectedRegistered = true
-        }
-
-        if (!headsetReceiverRegistered) {
-            ContextCompat.registerReceiver(this, headsetReceiver, headsetReceiverIntentFilter,
-                ContextCompat.RECEIVER_EXPORTED)
-            headsetReceiverRegistered = true
-        }
-    }
-
-    private var bluetoothConnectedRegistered = false
-    private val bluetoothConnectedIntentFilter = IntentFilter().apply {
-        addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
-        addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
-        addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
-    }
-    private val bluetoothReceiver: BroadcastReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent?) {
-            when (intent?.action) {
-                BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED -> {
-                    when (intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)) {
-                        BluetoothA2dp.STATE_CONNECTED -> if (Preferences.isResumeOnConnect(true)) {
-                            player.play()
-                        }
-                        BluetoothA2dp.STATE_DISCONNECTED -> if (Preferences.isPauseOnDisconnect(true)) {
-                            player.pause()
-                        }
-                    }
-                }
-                BluetoothDevice.ACTION_ACL_CONNECTED ->
-                    if (context.isBluetoothA2dpConnected() && Preferences.isResumeOnConnect(true)) {
-                        player.play()
-                    }
-                BluetoothDevice.ACTION_ACL_DISCONNECTED ->
-                    if (context.isBluetoothA2dpDisconnected() && Preferences.isPauseOnDisconnect(true)) {
-                        player.pause()
-                    }
-            }
-        }
-    }
-
-    private var receivedHeadsetConnected = false
-    private var headsetReceiverRegistered = false
-    private val headsetReceiverIntentFilter = IntentFilter(Intent.ACTION_HEADSET_PLUG)
-    private val headsetReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (Intent.ACTION_HEADSET_PLUG == intent.action && !isInitialStickyBroadcast) {
-                when (intent.getIntExtra("state", -1)) {
-                    0 -> if (Preferences.isPauseOnDisconnect(false)) {
-                        player.pause()
-                    }
-                    // Check whether the current song is empty which means the playing queue hasn't restored yet
-                    1 -> if (Preferences.isResumeOnConnect(false)) {
-                        if (player.currentMediaItem != null) {
-                            player.play()
-                        } else {
-                            receivedHeadsetConnected = true
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    companion object {
-        private const val PACKAGE_NAME = "com.mardous.booming"
-
-        const val ACTION_PLAY_SONG = "$PACKAGE_NAME.action.ACTION_PLAY_SONG"
-        const val EXTRA_SONG_ID = "$PACKAGE_NAME.extra.SONG_ID"
-        const val EXTRA_SONG_SOURCE = "$PACKAGE_NAME.extra.SONG_SOURCE"
-
-        private const val NOTIFICATION_ID = 1
-        private const val CHANNEL_ID = "playing_notification"
-
-        private const val TAG = "PlaybackService"
-
-        private const val MAX_RETRY_COUNT_AFTER_ERROR = 3
-
-        private const val REWIND_INSTEAD_PREVIOUS_MILLIS = 5000L
-
-        private const val FOREGROUND_SERVICE_TIMEOUT = (60 * 1000) * 2L
-    }
-}
